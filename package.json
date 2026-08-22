@@ -1,0 +1,57 @@
+{
+  "name": "ashta-eight-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ashta Eight R1 REST API — Node/Express + Prisma + PostgreSQL (RLS)",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "reminders:sweep": "tsx src/subscriptions/reminders.ts",
+    "sessions:sweep": "tsx src/notifications/session-reminders.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "db:roles": "set -a; . ./.env; set +a; psql \"${DATABASE_URL%%\\?*}\" -v ON_ERROR_STOP=1 -f prisma/rls/000_roles.sql",
+    "db:rls": "set -a; . ./.env; set +a; psql \"${DATABASE_URL%%\\?*}\" -v ON_ERROR_STOP=1 -f prisma/rls/policies.sql",
+    "db:seed": "set -a; . ./.env; set +a; psql \"${DATABASE_URL%%\\?*}\" -v ON_ERROR_STOP=1 -f prisma/seed.sql",
+    "db:verify": "set -a; . ./.env; set +a; psql \"${DATABASE_URL%%\\?*}\" -v ON_ERROR_STOP=1 -f prisma/rls/verify.sql",
+    "db:setup": "prisma migrate deploy && npm run db:roles && npm run db:rls && npm run db:seed && npm run db:verify",
+    "test": "tsx src/recommendation/engine.test.ts && tsx src/pages/sanitize.test.ts",
+    "qa": "tsx src/qa/api.test.ts",
+    "qa:all": "npm run typecheck && npm run test && npm run db:verify && npm run qa"
+  },
+  "prisma": {
+    "schema": "prisma/schema.prisma"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^26.1.1",
+    "@types/sanitize-html": "^2.16.1",
+    "prisma": "^5.22.0",
+    "tsx": "^4.23.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1085.0",
+    "@aws-sdk/s3-request-presigner": "^3.1085.0",
+    "@prisma/client": "^5.22.0",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.6.0",
+    "google-auth-library": "^10.9.0",
+    "jose": "^6.2.3",
+    "jsonwebtoken": "^9.0.3",
+    "otplib": "^13.4.1",
+    "pino": "^10.3.1",
+    "pino-http": "^11.0.0",
+    "sanitize-html": "^2.17.7",
+    "stripe": "^22.3.1",
+    "zod": "^4.4.3"
+  }
+}

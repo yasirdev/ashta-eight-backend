@@ -1,0 +1,783 @@
+// Ashta Eight — R1 data model (Architect / Agent 0)
+// Contract source of truth: /contracts/contracts.md
+// Conventions: tables snake_case plural, models PascalCase, UUID PKs,
+// timestamptz UTC, money = integer minor units (pence) + ISO currency.
+// RLS is NOT expressed here — see prisma/rls/policies.sql (applied via migration).
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [citext, pgcrypto]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+// R1 ships member + administrator. R2 roles are listed now so RLS/claims never
+// need restructuring — see policies.sql (app.is_staff / role checks).
+enum UserRole {
+  member
+  administrator
+  coach // R2
+  content_manager // R2
+  pa // R2
+}
+
+enum AuthProvider {
+  password
+  apple
+  google
+}
+
+enum VerificationPurpose {
+  email_verify
+  password_reset
+}
+
+enum SubscriptionStatus {
+  incomplete // checkout started, not yet paid
+  active
+  past_due
+  canceled // set to cancel at period end OR ended
+  expired
+  paused // admin-paused (Stripe pause_collection); NOT counted by current_tier_rank → no tier access
+}
+
+enum BillingInterval {
+  one_time
+  monthly
+  annual
+}
+
+enum BillingStatus {
+  pending
+  succeeded
+  refunded
+  failed
+}
+
+enum ContentType {
+  video
+  audio
+}
+
+// The three programme pillars / questionnaire categories.
+enum Pillar {
+  align // face-yoga
+  sculpt // subconscious-reprogramming
+  evolve // quantum-identity
+}
+
+enum ContentProgressStatus {
+  not_started
+  in_progress
+  completed
+}
+
+enum BookingType {
+  live_cohort
+  coaching
+}
+
+enum BookingStatus {
+  booked
+  canceled
+  completed
+  no_show
+}
+
+// Live Cohort batches: batch_1 = Mon/Wed/Fri, batch_2 = Tue/Thu/Sat.
+enum CohortBatch {
+  batch_1
+  batch_2
+}
+
+enum CoachingSlotStatus {
+  open
+  full
+  closed
+}
+
+// R1 captures 'applied' only. R2 extends the pipeline; enum grows without a
+// table restructure.
+enum LeadStage {
+  applied
+  contacted // R2
+  qualified // R2
+  converted // R2
+  lost // R2
+}
+
+enum DevicePlatform {
+  ios
+  android
+}
+
+enum NotificationType {
+  renewal_reminder
+  new_content
+  session_reminder
+}
+
+// The recommendation engine's input seam. Questionnaire today; ar_face_scan
+// slots in later WITHOUT a schema change (see contracts.md §5).
+enum RecommendationInputType {
+  questionnaire
+  ar_face_scan // Phase 2 — architecture-ready, not built
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Identity & auth
+// ─────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id              String   @id @default(uuid()) @db.Uuid
+  email           String   @unique @db.Citext
+  emailVerifiedAt DateTime? @map("email_verified_at") @db.Timestamptz(6)
+  displayName     String?  @map("display_name")
+  phone           String? // admin roster filter; optional
+  notes           String? // admin-private client notes (admin/service write only)
+  role            UserRole @default(member)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  lastActiveAt    DateTime? @map("last_active_at") @db.Timestamptz(6)
+  /// 8-week map anchor (ARCH_SPEC_G4_G8 §3.2). Set ONCE by the Stripe webhook on a
+  /// subscription's first transition to active (COALESCE-guarded), never overwritten
+  /// — an upgrade, pause or re-subscribe must not reset the member's journey. NOT
+  /// derived from subscriptions.created_at: those rows are created at CHECKOUT START,
+  /// so an abandoned checkout would place a new member at week 13 on day one.
+  /// Member-immutable: frozen for non-staff sessions by app.prevent_self_role_change()
+  /// (policies.sql §trigger), and never accepted by PATCH /me.
+  planStartedAt   DateTime? @map("plan_started_at") @db.Timestamptz(6)
+  /// Preferred UI language, BCP-47 (CR-003 multilingual FOUNDATION). Plain text, not an
+  /// FK to `locales` — the contract specifies `text nullable`, and referential coupling
+  /// buys nothing while it is unreachable in R1. NOT accepted on PATCH /me in R1 (no
+  /// user-facing language picker until R2); the locale-resolution read seam still reads
+  /// it when present. With zero `translations` rows seeded, every response is byte-
+  /// identical to today.
+  locale          String?
+  /// Personal Data screen (DESIGN_GAPS G-12). DOB is GDPR personal data — handled like
+  /// the other user PII on this row. Both accepted on PATCH /me.
+  dateOfBirth     DateTime? @map("date_of_birth") @db.Date
+  /// Free text, nullable — deliberately NOT an enum: the client has not fixed a value
+  /// set, and inventing one would be closer to inventing schema than leaving it open.
+  gender          String?
+  /// Member avatar (DESIGN_GAPS G-8 / ARCH_SPEC_G4_G8 §5). An S3 object key under the
+  /// `avatars/<userId>/` prefix ONLY. Served to the member as `avatarUrl` — a 15-min
+  /// presigned GET, deliberately NOT the public CDN G-7 uses for artwork: an avatar is
+  /// personal data and must not sit at a permanent public URL. `avatarUrl` resolves to
+  /// null when S3 is unconfigured, so a broken image can never break login. Member-
+  /// writable (unlike role/notes) — the PATCH /me key regex, pinned to THIS user's own
+  /// prefix, is the only guard against a pointer into the tier-gated `audio/` namespace.
+  avatarObjectKey String?   @map("avatar_object_key")
+  /// Free-trial anchor (CR-001). Set ONCE by `POST /me/trial` (service role); the
+  /// trial is active while `now() < trial_started_at + 15 days`. One-per-account is
+  /// enforced by the activation guard (only sets when NULL); member-immutable
+  /// (frozen by app.prevent_self_role_change(), like role/notes/plan_started_at) so a
+  /// member cannot self-grant or extend a trial. NULL = never trialed.
+  trialStartedAt  DateTime? @map("trial_started_at") @db.Timestamptz(6)
+  /// Soft-delete marker (account deletion). Set by `DELETE /me` (self) or an admin
+  /// client-management action (service role), which also revoke all sessions; a
+  /// soft-deleted account cannot log in. Data is RETAINED (soft) — GDPR hard-erasure
+  /// is a separate, later sweep. Member-immutable (frozen by the §trigger). NULL =
+  /// not deleted.
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(6)
+  /// Admin disable marker. Set by an admin (service role) to block a client's login
+  /// WITHOUT deleting them — reversible via enable. A disabled account's sessions are
+  /// revoked and login returns 403 account_disabled. Member-immutable (§trigger).
+  /// Distinct from deleted_at (temporary block vs. account removal). NULL = enabled.
+  disabledAt      DateTime? @map("disabled_at") @db.Timestamptz(6)
+
+  identities         AuthIdentity[]
+  refreshTokens      RefreshToken[]
+  verificationTokens VerificationToken[]
+  subscriptions      Subscription[]
+  twoFactor          TwoFactorSecret?
+  billing            BillingRecord[]
+  contentProgress    ContentProgress[]
+  completions        ContentCompletion[]
+  progressEntries    ProgressEntry[]
+  bookings           Booking[]
+  deviceTokens       DeviceToken[]
+  notifications      Notification[]
+  recommendations    RecommendationRequest[]
+  coachingLeads      CoachingLead[]
+  coachingSlots      CoachingSlot[] // slots this user (a coach/admin) owns
+  authoredContent    Content[]      @relation("ContentAuthor")
+
+  @@index([role])
+  @@index([createdAt]) // signup-growth analytics
+  @@index([lastActiveAt]) // active-member analytics
+  @@map("users")
+}
+
+model AuthIdentity {
+  id              String       @id @default(uuid()) @db.Uuid
+  userId          String       @map("user_id") @db.Uuid
+  provider        AuthProvider
+  // For `password`: providerSubject = userId. For apple/google: the provider `sub`.
+  providerSubject String       @map("provider_subject")
+  passwordHash    String?      @map("password_hash") // null for OAuth identities
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerSubject])
+  @@index([userId])
+  @@map("auth_identities")
+}
+
+// Admin 2FA (TOTP). Separate table so the shared secret never rides along in a
+// users SELECT. Locked to the service role in RLS (auth-secret table).
+model TwoFactorSecret {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @unique @map("user_id") @db.Uuid
+  secret     String // TOTP shared secret (encrypt at rest — see contracts §2)
+  enabledAt  DateTime? @map("enabled_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("two_factor_secrets")
+}
+
+// Refresh tokens = server-side sessions (30-day persistence). Only the hash is
+// stored; the raw token lives with the client.
+model RefreshToken {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  tokenHash   String    @unique @map("token_hash")
+  deviceLabel String?   @map("device_label")
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt   DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// Single-use tokens for email verification + password reset (only hash stored).
+model VerificationToken {
+  id        String              @id @default(uuid()) @db.Uuid
+  userId    String              @map("user_id") @db.Uuid
+  purpose   VerificationPurpose
+  tokenHash String              @unique @map("token_hash")
+  expiresAt DateTime            @map("expires_at") @db.Timestamptz(6)
+  usedAt    DateTime?           @map("used_at") @db.Timestamptz(6)
+  createdAt DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@map("verification_tokens")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Programmes, subscriptions, billing
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The four purchasable programmes/tiers. Rows, not an enum, so pricing and
+// naming change without a migration. `tierRank` gives the access ordering:
+// content with requiredTierRank <= a member's active tierRank is unlocked.
+model Programme {
+  id              String          @id @default(uuid()) @db.Uuid
+  code            String          @unique // stable slug, e.g. "ashta_sculpt"
+  name            String
+  description     String?
+  tierRank        Int             @unique @map("tier_rank") // access ordering; higher = more access
+  priceMinor      Int             @map("price_minor") // pence
+  currency        String          @default("GBP")
+  billingInterval BillingInterval @default(monthly) @map("billing_interval")
+  autoRenew       Boolean         @default(false) @map("auto_renew") // Ashta Sculpt = true
+  stripePriceId   String?         @map("stripe_price_id")
+  isActive        Boolean         @default(true) @map("is_active")
+  /// Ordered marketing rows shown on the Subscription card (Figma 79:238).
+  /// Ordered by array position; plain labels, no per-row metadata by design.
+  /// DB-enforced: NOT NULL, DEFAULT '{}', CHECK <= 8 elements, no NULL/blank
+  /// element (constraint `programmes_features_valid`, hand-written in the
+  /// migration — Prisma does not model CHECK constraints, same as RLS).
+  features        String[]        @default([])
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  subscriptions   Subscription[]
+  billing         BillingRecord[]
+  recommendations RecommendationRequest[]
+
+  @@map("programmes")
+}
+
+model Subscription {
+  id                   String             @id @default(uuid()) @db.Uuid
+  userId               String             @map("user_id") @db.Uuid
+  programmeId          String             @map("programme_id") @db.Uuid
+  status               SubscriptionStatus @default(incomplete)
+  stripeCustomerId     String?            @map("stripe_customer_id")
+  stripeSubscriptionId String?            @unique @map("stripe_subscription_id")
+  currentPeriodStart   DateTime?          @map("current_period_start") @db.Timestamptz(6)
+  currentPeriodEnd     DateTime?          @map("current_period_end") @db.Timestamptz(6)
+  cancelAtPeriodEnd    Boolean            @default(false) @map("cancel_at_period_end")
+  autoRenew            Boolean            @default(false) @map("auto_renew")
+  cohortBatch          CohortBatch?       @map("cohort_batch") // Live Cohort enrolment for this membership
+  renewalReminderSentAt DateTime?         @map("renewal_reminder_sent_at") @db.Timestamptz(6)
+  createdAt            DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  programme Programme       @relation(fields: [programmeId], references: [id])
+  billing   BillingRecord[]
+
+  @@index([userId, status])
+  @@index([status]) // active-member / MRR analytics
+  @@index([currentPeriodEnd]) // renewal-reminder sweep
+  @@map("subscriptions")
+}
+
+// Immutable financial history (references only — never card data). programmeId
+// is snapshotted for revenue-by-programme even if the subscription later changes.
+model BillingRecord {
+  id                    String        @id @default(uuid()) @db.Uuid
+  userId                String        @map("user_id") @db.Uuid
+  subscriptionId        String?       @map("subscription_id") @db.Uuid
+  programmeId           String?       @map("programme_id") @db.Uuid
+  stripePaymentIntentId String?       @map("stripe_payment_intent_id")
+  stripeInvoiceId       String?       @map("stripe_invoice_id")
+  stripeChargeId        String?       @map("stripe_charge_id")
+  amountMinor           Int           @map("amount_minor")
+  currency              String        @default("GBP")
+  status                BillingStatus @default(succeeded)
+  description           String?
+  invoiceUrl            String?       @map("invoice_url") // Stripe-hosted invoice/receipt PDF
+  occurredAt            DateTime      @map("occurred_at") @db.Timestamptz(6)
+  createdAt             DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id])
+  programme    Programme?    @relation(fields: [programmeId], references: [id])
+
+  @@index([userId, occurredAt])
+  @@index([occurredAt]) // revenue-over-time analytics
+  @@index([programmeId, occurredAt]) // revenue-by-programme analytics
+  @@map("billing_records")
+}
+
+// Stripe webhook idempotency ledger (admin/system only — locked in RLS).
+model WebhookEvent {
+  id            String   @id @default(uuid()) @db.Uuid
+  stripeEventId String   @unique @map("stripe_event_id")
+  type          String
+  payload       Json
+  processedAt   DateTime? @map("processed_at") @db.Timestamptz(6)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("webhook_events")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Content & progress
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Video refs (Mux/Cloudflare playback id) OR audio (S3 key) — never bytes.
+// Gated by requiredTierRank; published when publishedAt is set (null = draft).
+model Content {
+  id                   String      @id @default(uuid()) @db.Uuid
+  type                 ContentType
+  pillar               Pillar
+  title                String
+  description          String?
+  requiredTierRank     Int         @default(0) @map("required_tier_rank") // 0 = free/preview
+  videoRef             String?     @map("video_ref") // Mux/Cloudflare playback id (video only)
+  s3Key                String?     @map("s3_key") // S3 object key (audio only)
+  durationSeconds      Int?        @map("duration_seconds")
+  offlineDownloadable  Boolean     @default(false) @map("offline_downloadable")
+  weekNumber           Int?        @map("week_number") // 8-week map ordering
+  orderIndex           Int         @default(0) @map("order_index")
+  publishedAt          DateTime?   @map("published_at") @db.Timestamptz(6)
+  /// Card artwork: an S3 object key under the `images/` prefix only (ARCH_SPEC_G4_G8
+  /// §4). Serialized to members as `thumbnailUrl` — an absolute CDN URL, never the raw
+  /// key. Artwork is NOT tier-gated (it appears on paywall cards), so it is served from
+  /// a stable cacheable URL rather than presigned per request. The API pins the key to
+  /// the exact shape presignUpload('image') mints; the bucket that holds artwork also
+  /// holds tier-gated audio, so a free-text key here would be a route to publishing paid
+  /// content at a permanent public URL.
+  thumbnailObjectKey   String?     @map("thumbnail_object_key")
+  /// CR-001 "free set": admin marks content as part of the free-trial preview. A
+  /// member with an ACTIVE trial can see published `free_preview` rows regardless of
+  /// tier (enforced in RLS content_select). Independent of tier gating — a free-set
+  /// row still respects `published_at`. Default false, so nothing is free by accident.
+  freePreview          Boolean     @default(false) @map("free_preview")
+  createdByAdminId     String?     @map("created_by_admin_id") @db.Uuid
+  createdAt            DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  createdBy   User?               @relation("ContentAuthor", fields: [createdByAdminId], references: [id])
+  progress    ContentProgress[]
+  completions ContentCompletion[]
+
+  @@index([pillar])
+  @@index([requiredTierRank])
+  @@index([publishedAt])
+  @@index([type, pillar, publishedAt])
+  @@map("content")
+}
+
+// Per-member playback state: resume position + completion.
+model ContentProgress {
+  id              String                @id @default(uuid()) @db.Uuid
+  userId          String                @map("user_id") @db.Uuid
+  contentId       String                @map("content_id") @db.Uuid
+  status          ContentProgressStatus @default(not_started)
+  positionSeconds Int                   @default(0) @map("position_seconds") // video/audio resume
+  completedAt     DateTime?             @map("completed_at") @db.Timestamptz(6)
+  updatedAt       DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content Content @relation(fields: [contentId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, contentId])
+  @@index([userId])
+  @@map("content_progress")
+}
+
+// Append-only session history. `content_progress` holds STATE (resume position,
+// current status, one row per user+content); this holds EVENTS (one row per
+// completion, never mutated). Two jobs, two tables — see ARCH_SPEC_G4_G8 §1.2.
+// durationSeconds is a SNAPSHOT: the dashboard aggregate must never join
+// `content`, or RLS/tier changes and admin duration edits silently rewrite a
+// member's past. RLS (incl. the deliberate absence of UPDATE/DELETE policies)
+// lives in prisma/rls/policies.sql, as always.
+model ContentCompletion {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @map("user_id") @db.Uuid
+  contentId       String?  @map("content_id") @db.Uuid // SET NULL — history outlives deleted content
+  durationSeconds Int?     @map("duration_seconds") // snapshot at completion
+  completedAt     DateTime @default(now()) @map("completed_at") @db.Timestamptz(6) // SERVER-SET
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content Content? @relation(fields: [contentId], references: [id], onDelete: SetNull)
+
+  @@index([userId, completedAt(sort: Desc)])
+  @@map("content_completions")
+}
+
+// Presentational browse tiles for the Home screen (ARCH_SPEC_G4_G8 §2). NOT a
+// fourth classification dimension: each row resolves SERVER-SIDE to a set of
+// content via the optional pillar/type filter, and the app only ever knows the
+// `slug`. That is what lets a tile be promoted from a saved filter to an explicit
+// curated membership later with no contract change and no app release.
+// A row with NO filter is treated as UNCONFIGURED and returns an empty page —
+// a NULL filter would otherwise mean "no filter" and return everything.
+model ContentCategory {
+  id        String       @id @default(uuid()) @db.Uuid
+  slug      String       @unique // the ONLY thing the app knows, e.g. 'neural-audio'
+  label     String // client copy
+  iconKey   String       @map("icon_key") // → a BUNDLED app asset, never a remote image
+  pillar    Pillar? // optional server-side filter
+  type      ContentType? // optional server-side filter
+  position  Int          @default(0)
+  isActive  Boolean      @default(true) @map("is_active")
+  createdAt DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([position])
+  @@map("content_categories")
+}
+
+// Self-reported progress log for the dashboard / 8-week map (journaling + metrics).
+model ProgressEntry {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  entryDate DateTime @map("entry_date") @db.Date
+  note      String?
+  metrics   Json? // flexible self-report metrics; shape defined by client at build time
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, entryDate])
+  @@map("progress_entries")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bookings — Live Cohort + coaching
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Admin/coach-published coaching availability that members book against.
+model CoachingSlot {
+  id        String             @id @default(uuid()) @db.Uuid
+  ownerId   String             @map("owner_id") @db.Uuid // admin/coach who owns the slot
+  startsAt  DateTime           @map("starts_at") @db.Timestamptz(6)
+  endsAt    DateTime           @map("ends_at") @db.Timestamptz(6)
+  capacity  Int                @default(1)
+  status    CoachingSlotStatus @default(open)
+  createdAt DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  owner    User      @relation(fields: [ownerId], references: [id])
+  bookings Booking[]
+
+  @@index([startsAt, status])
+  @@map("coaching_slots")
+}
+
+model Booking {
+  id             String        @id @default(uuid()) @db.Uuid
+  userId         String        @map("user_id") @db.Uuid
+  type           BookingType
+  status         BookingStatus @default(booked)
+  batch          CohortBatch? // set for live_cohort
+  coachingSlotId String?       @map("coaching_slot_id") @db.Uuid // set for coaching
+  scheduledStart DateTime      @map("scheduled_start") @db.Timestamptz(6)
+  scheduledEnd   DateTime?     @map("scheduled_end") @db.Timestamptz(6)
+  zoomMeetingId  String?       @map("zoom_meeting_id")
+  zoomJoinUrl    String?       @map("zoom_join_url")
+  reminderSentAt DateTime?     @map("reminder_sent_at") @db.Timestamptz(6)
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  coachingSlot CoachingSlot? @relation(fields: [coachingSlotId], references: [id])
+
+  @@index([userId, scheduledStart])
+  @@index([scheduledStart, status]) // reminder sweep
+  @@map("bookings")
+}
+
+// Live Cohort = shared recurring sessions per batch (batch_1 Mon/Wed/Fri,
+// batch_2 Tue/Thu/Sat). ONE row per session, all enrolled members join the same
+// Zoom link — not a per-member booking (that would be 10k rows/session).
+// Enrolment lives on Subscription.cohortBatch.
+model LiveCohortSession {
+  id            String      @id @default(uuid()) @db.Uuid
+  batch         CohortBatch
+  title         String?
+  startsAt      DateTime    @map("starts_at") @db.Timestamptz(6)
+  endsAt        DateTime?   @map("ends_at") @db.Timestamptz(6)
+  zoomMeetingId String?     @map("zoom_meeting_id")
+  zoomJoinUrl   String?     @map("zoom_join_url")
+  createdAt     DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([batch, startsAt])
+  @@map("live_cohort_sessions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Coaching leads (website application form → admin pipeline)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model CoachingLead {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String?   @map("user_id") @db.Uuid // null when applied pre-account (website form)
+  fullName  String    @map("full_name")
+  email     String    @db.Citext
+  phone     String?
+  stage     LeadStage @default(applied)
+  source    String    @default("website_form")
+  answers   Json? // application form answers
+  notes     String? // admin-private notes
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([stage, createdAt]) // pipeline-conversion analytics
+  @@index([email])
+  @@map("coaching_leads")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Notifications (FCM)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model DeviceToken {
+  id         String         @id @default(uuid()) @db.Uuid
+  userId     String         @map("user_id") @db.Uuid
+  fcmToken   String         @unique @map("fcm_token")
+  platform   DevicePlatform
+  lastSeenAt DateTime       @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  createdAt  DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("device_tokens")
+}
+
+// Sent-push log; also the idempotency guard for reminder types.
+model Notification {
+  id        String           @id @default(uuid()) @db.Uuid
+  userId    String           @map("user_id") @db.Uuid
+  type      NotificationType
+  title     String
+  body      String
+  data      Json?
+  sentAt    DateTime?        @map("sent_at") @db.Timestamptz(6)
+  readAt    DateTime?        @map("read_at") @db.Timestamptz(6)
+  createdAt DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Recommendation engine (modular I/O — AR-input-ready)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One row per intake. Completable WITHOUT an account (userId null + sessionKey);
+// linked to the user after signup. `inputType` + `input` jsonb is the seam that
+// lets a future ar_face_scan feed the same engine with no schema change.
+model RecommendationRequest {
+  id                    String                  @id @default(uuid()) @db.Uuid
+  userId                String?                 @map("user_id") @db.Uuid
+  sessionKey            String?                 @map("session_key") // anon id before signup
+  inputType             RecommendationInputType @default(questionnaire) @map("input_type")
+  input                 Json // questionnaire answers (or future AR feature vector)
+  gdprConsentAt         DateTime?               @map("gdpr_consent_at") @db.Timestamptz(6)
+  recommendedProgrammeId String?                @map("recommended_programme_id") @db.Uuid
+  rationale             String? // >= 2 sentences
+  engineVersion         String?                 @map("engine_version")
+  createdAt             DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user                 User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  recommendedProgramme Programme? @relation(fields: [recommendedProgrammeId], references: [id])
+
+  @@index([userId])
+  @@index([sessionKey])
+  @@map("recommendation_requests")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multilingual FOUNDATION (CR-003 — authorized 2026-07-26; foundations = R1, the 20
+// languages' copy + switching = R2). The machinery ships now while Agent 2's UI is
+// unbuilt; R1 seeds all 20 locales (only `en` active) and ZERO translations, so every
+// response returns the base/English value and behaviour is unchanged. Media
+// localization is explicitly OUT of scope. See contracts §7 (2026-07-26).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Reference set of supported languages. `code` is a BCP-47 tag (PK). Active-read
+// public, staff-write (policies.sql). R1: all 20 seeded, only `en` is active.
+model Locale {
+  code       String   @id // BCP-47 tag, e.g. 'en', 'ar', 'zh-Hans'
+  name       String // English name, e.g. 'Arabic'
+  nativeName String   @map("native_name") // endonym, e.g. 'العربية'
+  isRtl      Boolean  @default(false) @map("is_rtl")
+  isActive   Boolean  @default(false) @map("is_active")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  translations Translation[]
+
+  @@map("locales")
+}
+
+// Generic translation sidecar: one row per (entity, field, locale). Kept OUT of the
+// entity tables so localizing a new field never migrates the entity, and so an unqueried
+// language costs nothing. `entity_id` is uuid (every localizable R1 entity has a uuid PK).
+// RLS: read MIRRORS the parent entity's SELECT policy (a member sees a translation only
+// for a row they can already see), staff-write — see policies.sql. EMPTY in R1.
+model Translation {
+  id         String   @id @default(uuid()) @db.Uuid
+  entityType String   @map("entity_type") // e.g. 'content', 'programme', 'content_category'
+  entityId   String   @map("entity_id") @db.Uuid
+  field      String // the entity column being localized, e.g. 'title'
+  locale     String // FK → locales.code
+  value      String
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  localeRef Locale @relation(fields: [locale], references: [code])
+
+  @@unique([entityType, entityId, field, locale])
+  @@index([entityType, entityId, locale])
+  @@map("translations")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Community (R2 — schema only, no logic; locked in RLS until R2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model CommunityPost {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  body       String
+  imageS3Key String?   @map("image_s3_key")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  deletedAt  DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  comments  CommunityComment[]
+  reactions CommunityReaction[]
+
+  @@index([createdAt])
+  @@map("community_posts")
+}
+
+model CommunityComment {
+  id        String    @id @default(uuid()) @db.Uuid
+  postId    String    @map("post_id") @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  body      String
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  post CommunityPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@index([postId])
+  @@map("community_comments")
+}
+
+model CommunityReaction {
+  id        String   @id @default(uuid()) @db.Uuid
+  postId    String   @map("post_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  kind      String // reaction type (R2 defines set)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  post CommunityPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@unique([postId, userId, kind])
+  @@map("community_reactions")
+}
+
+// CR-008 — Info pages (privacy/terms/about): admin-authored HTML, served to the app.
+// Public-ish, same posture as `programmes`: published rows readable by any app-role
+// session (incl. signed-out signup consent); staff manage. Body is sanitized on write.
+model InfoPage {
+  id               String   @id @default(uuid()) @db.Uuid
+  slug             String   @unique // 'privacy-policy' | 'terms' | 'about' — the only thing the app asks for
+  title            String
+  bodyHtml         String   @map("body_html") // sanitized HTML (see src/pages/sanitize.ts)
+  isPublished      Boolean  @default(false) @map("is_published")
+  updatedByAdminId String?  @map("updated_by_admin_id") @db.Uuid
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("info_pages")
+}
+
+// CR-008 — Help-Center FAQ entries: flat ordered list (categories are an additive R2
+// upgrade). Same public-ish posture; answer HTML sanitized on write.
+model Faq {
+  id               String   @id @default(uuid()) @db.Uuid
+  question         String
+  answerHtml       String   @map("answer_html")
+  position         Int      @default(0)
+  isPublished      Boolean  @default(true) @map("is_published")
+  updatedByAdminId String?  @map("updated_by_admin_id") @db.Uuid
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([position])
+  @@map("faqs")
+}

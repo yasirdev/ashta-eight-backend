@@ -1,0 +1,21 @@
+-- DESIGN_GAPS G-8 / ARCH_SPEC_G4_G8 §5 — member avatar (contracts §7, 2026-07-26).
+--
+-- `avatar_object_key` holds an S3 object key under the `avatars/<userId>/` prefix ONLY.
+-- Served to the member as `avatarUrl` — a 15-min presigned GET, deliberately NOT the
+-- public CDN G-7 uses for artwork: an avatar is personal data and must not sit at a
+-- permanent public URL that outlives the account. `avatarUrl` is null when S3 is
+-- unconfigured, so a broken image can never break login.
+--
+-- No RLS change — a column on `users` inherits `users_select`/`users_update`. Unlike
+-- role/notes/plan_started_at it is legitimately member-writable, so it is NOT added to
+-- the §trigger guard; the PATCH /me key regex (pinned to the caller's OWN avatars/<id>/
+-- prefix) is the guard against a pointer into the tier-gated `audio/` namespace.
+--
+-- GDPR: erasure must delete the S3 object, not just this column — an owed retention-sweep
+-- extension (PENDING_LOG §2.1 / docs/DEPLOYMENT.md). Flagged, not implemented here: there
+-- is no account-deletion endpoint in R1 to extend.
+--
+-- Rollback: ALTER TABLE "users" DROP COLUMN "avatar_object_key";
+
+-- AlterTable
+ALTER TABLE "users" ADD COLUMN     "avatar_object_key" TEXT;
