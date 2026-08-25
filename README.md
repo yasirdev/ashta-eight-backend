@@ -21,8 +21,16 @@ createdb ashta_eight          # or CREATE DATABASE ... owned by the migration us
 npm run db:setup              # migrate → roles → RLS → seed → verify (one command)
 ```
 `db:setup` runs on a **fresh** database. It applies migrations, creates the two roles,
-applies RLS policies, seeds, then runs `db:verify` (fails loudly if RLS isn't enforced).
-Individual steps: `db:roles`, `db:rls`, `db:seed`, `db:verify`.
+grants, applies RLS policies + the service-bypass policy, seeds, then runs `db:verify`
+(fails loudly if RLS isn't enforced).
+Individual steps: `db:roles`, `db:grants`, `db:rls`, `db:bypass`, `db:seed`, `db:verify`.
+
+> **`db:setup` is LOCAL-ONLY.** It runs `db:roles` (`CREATE ROLE`), which needs a
+> superuser we don't have on cPanel/shared hosting. For any real environment use
+> **`db:deploy`** (`migrate deploy → db:grants → db:rls → db:bypass`): it assumes the
+> host-provisioned roles already exist and emulates `BYPASSRLS` per-table via
+> `020_service_bypass.sql`. Role names come from `APP_ROLE`/`SERVICE_ROLE` (see
+> `.env.example` for the cPanel-prefixed values).
 
 **Re-running:** `policies.sql` uses `CREATE POLICY` (not idempotent), so to rebuild from
 scratch run `npx prisma migrate reset` first, then `npm run db:setup`.

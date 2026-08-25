@@ -3,17 +3,24 @@
 -- Deny-by-default: RLS is enabled + FORCED on every table; a row is visible only
 -- if a policy below explicitly permits it.
 --
--- TWO DATABASE ROLES (created in migration 000_roles, not here):
+-- TWO DATABASE ROLES (local names ashta_app / ashta_service; on cPanel they are
+-- account-prefixed: appashtaeight_ashta_app / appashtaeight_ashta_service. Created
+-- locally by 000_roles_local.sql; host-provisioned on cPanel):
 --   ashta_app     — NOSUPERUSER, NO BYPASSRLS. Handles ALL authenticated member/
 --                   admin requests. Backend runs per request:
 --                       SET LOCAL app.user_id  = '<uuid>';
 --                       SET LOCAL app.user_role = '<role>';
 --                   Every policy below is evaluated against this session context.
---   ashta_service — BYPASSRLS. Used ONLY for legitimately cross-ownership system
---                   flows: registration/login, token issuance + verification,
---                   Stripe webhook activation, FCM send-logging, anonymous
---                   questionnaire capture, and cron sweeps (renewal reminders).
---                   Narrow, audited surface — never used for member-supplied reads.
+--   ashta_service — NO BYPASSRLS on cPanel (the attribute needs a superuser we do
+--                   not have on shared hosting). Its bypass is emulated by an
+--                   explicit permissive policy `p_service_bypass`, created per
+--                   RLS-enabled table by 020_service_bypass.sql — which MUST be
+--                   re-run after every migration that adds an RLS-enabled table.
+--                   Used ONLY for legitimately cross-ownership system flows:
+--                   registration/login, token issuance + verification, Stripe
+--                   webhook activation, FCM send-logging, anonymous questionnaire
+--                   capture, and cron sweeps (renewal reminders). Narrow, audited
+--                   surface — never used for member-supplied reads.
 --
 -- The API layer adds authorization ON TOP of these policies; RLS is the floor,
 -- not the ceiling. Never trust the client for identity/role/tier.
@@ -22,8 +29,10 @@
 -- Session-context helpers (schema `app`)
 -- current_user_id / current_role / is_staff read only the session GUCs (no table
 -- access) → plain STABLE. current_tier_rank reads subscriptions+programmes, so it
--- is SECURITY DEFINER owned by ashta_service (BYPASSRLS) to evaluate tier
--- regardless of the caller's own RLS — see its comment for why that matters.
+-- is SECURITY DEFINER owned by ashta_service to evaluate tier regardless of the
+-- caller's own RLS — see its comment for why that matters. (ashta_service has no
+-- BYPASSRLS on cPanel; its p_service_bypass policy lets the definer read the
+-- subscriptions/programmes rows.)
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE SCHEMA IF NOT EXISTS app;
 
@@ -73,9 +82,11 @@ $$;
 
 -- Member's effective tier rank = highest tier_rank among ACTIVE, unexpired
 -- subscriptions. 0 (free/preview) when none. DB-authoritative — never passed by
--- the client. SECURITY DEFINER (owned by ashta_service, BYPASSRLS) so the
--- subscriptions/programmes reads bypass the CALLER's RLS. Without this, the
--- programmes RLS (is_active OR is_staff) would drop a programme the admin has
+-- the client. SECURITY DEFINER (owned by ashta_service) so the
+-- subscriptions/programmes reads run under the service role, not the CALLER's RLS.
+-- On cPanel the service role has no BYPASSRLS attribute; the definer instead reads
+-- those rows through the p_service_bypass policy (020_service_bypass.sql). Without
+-- this, the programmes RLS (is_active OR is_staff) would drop a programme the admin has
 -- deactivated (D1 anticipates re-pricing via is_active=false), silently
 -- collapsing an active paying member's tier to 0 and revoking their content.
 -- Safe: the WHERE clause scopes the sum to the caller's own user_id (session GUC),
@@ -89,13 +100,15 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
     AND s.status = 'active'
     AND (s.current_period_end IS NULL OR s.current_period_end > now())
 $$;
--- Own it by the BYPASSRLS service role (least privilege — not the superuser owner).
-ALTER FUNCTION app.current_tier_rank() OWNER TO ashta_service;
+-- Own it by the service role (least privilege — not the superuser owner); the
+-- p_service_bypass policy gives the definer its row access on cPanel.
+ALTER FUNCTION app.current_tier_rank() OWNER TO :"service_role";
 
 -- has_active_trial (CR-001): true iff the caller has an ACTIVE 15-day free trial.
 -- Reads users.trial_started_at for the current user only. SECURITY DEFINER (owned by
--- ashta_service, BYPASSRLS) for the same reason as current_tier_rank — it must not be
--- re-filtered by the caller's own RLS, and it is called from inside content_select.
+-- ashta_service; row access via p_service_bypass, not a BYPASSRLS attribute) for the
+-- same reason as current_tier_rank — it must not be re-filtered by the caller's own
+-- RLS, and it is called from inside content_select.
 -- The 15-day window is expressed here so the trial expires by construction: once
 -- trial_started_at is older than 15 days the free set silently drops, no cron needed.
 CREATE OR REPLACE FUNCTION app.has_active_trial() RETURNS boolean
@@ -107,7 +120,7 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
       AND u.trial_started_at > now() - interval '15 days'
   )
 $$;
-ALTER FUNCTION app.has_active_trial() OWNER TO ashta_service;
+ALTER FUNCTION app.has_active_trial() OWNER TO :"service_role";
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Helper to reduce boilerplate: enable + FORCE RLS on a table.
@@ -133,7 +146,8 @@ CREATE POLICY users_delete ON users FOR DELETE
 -- role in a profile update and (b) a BEFORE UPDATE trigger — see §trigger below.
 
 -- auth_identities / refresh_tokens / verification_tokens: NO app-role policy →
--- fully denied to members and admins. Touched only by ashta_service (BYPASSRLS).
+-- fully denied to members and admins. Touched only by ashta_service (via its
+-- p_service_bypass policy — no BYPASSRLS attribute on cPanel).
 ALTER TABLE auth_identities ENABLE ROW LEVEL SECURITY;
 ALTER TABLE auth_identities FORCE ROW LEVEL SECURITY;
 ALTER TABLE refresh_tokens ENABLE ROW LEVEL SECURITY;
@@ -477,28 +491,30 @@ CREATE TRIGGER trg_users_prevent_role_change
   FOR EACH ROW EXECUTE FUNCTION app.prevent_self_role_change();
 
 -- ═════════════════════════════════════════════════════════════════════════════
--- GRANTS (least-privilege for the app role; service role owns tables / bypasses)
+-- GRANTS (least-privilege for the app role; service role bypasses RLS via its
+-- p_service_bypass policy, NOT a BYPASSRLS attribute — see 020_service_bypass.sql)
 -- ═════════════════════════════════════════════════════════════════════════════
 -- Both roles need USAGE on `app`: ashta_app calls the helpers directly, and
 -- ashta_service is the DEFINER owner of current_tier_rank() (which resolves
 -- app.current_user_id() inside its body).
-GRANT USAGE ON SCHEMA app TO ashta_app, ashta_service;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ashta_app;
--- ashta_service is BYPASSRLS, which bypasses POLICIES — not table privileges. It
--- therefore needs this grant too, and `ALL TABLES` is evaluated when the statement runs,
--- so a table added by a later migration is NOT covered retroactively.
--- Deliberately duplicated from 000_roles.sql:23 (an idempotent GRANT, so re-running both
--- is harmless): 000_roles.sql is documented "run ONCE", while THIS file is the one the
+GRANT USAGE ON SCHEMA app TO :"app_role", :"service_role";
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO :"app_role";
+-- ashta_service's bypass is a POLICY (p_service_bypass), which controls row visibility —
+-- not table privileges. It therefore needs this grant too, and `ALL TABLES` is evaluated
+-- when the statement runs, so a table added by a later migration is NOT covered
+-- retroactively (re-run db:rls AND db:bypass after such a migration).
+-- Deliberately duplicated from 010_grants.sql (an idempotent GRANT, so re-running both
+-- is harmless): 010_grants.sql carries the baseline grants, while THIS file is the one the
 -- specs tell you to re-run after a migration adds a table. Without the line here,
 -- `npm run db:rls` alone left content_completions/content_categories readable by the app
 -- role and PERMISSION DENIED to the service role — found by the QA suite, 2026-07-23.
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ashta_service;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO :"service_role";
 -- Auth-secret tables carry no app-role policy, so RLS denies all rows; revoke
 -- table privileges too for defence in depth.
-REVOKE ALL ON auth_identities, refresh_tokens, verification_tokens, two_factor_secrets FROM ashta_app;
+REVOKE ALL ON auth_identities, refresh_tokens, verification_tokens, two_factor_secrets FROM :"app_role";
 -- Prisma's migration bookkeeping table is not part of the runtime surface for
 -- either role (migrations run as the owner). Revoke the blanket ALL-TABLES grant.
-REVOKE ALL ON _prisma_migrations FROM ashta_app, ashta_service;
+REVOKE ALL ON _prisma_migrations FROM :"app_role", :"service_role";
 -- users.notes is ADMIN-PRIVATE. A non-staff self-update can't change it (frozen by
 -- the §trigger guard below, same posture as `role`); staff/service write it via the
 -- admin client-notes endpoint. No member endpoint exposes notes in its response.
