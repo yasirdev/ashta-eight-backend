@@ -48,6 +48,11 @@ const schema = z.object({
   // Where the member/admin apps live — used to build email verify/reset links.
   APP_BASE_URL: z.string().default("http://localhost:3000"),
 
+  // Passenger base-URI prefix. Phusion Passenger mounts the app at /api but passes the
+  // full path through unstripped, so Express sees /api/health for a /health route. Set
+  // BASE_PATH=/api in production to strip it before routing; unset locally ('') = no-op.
+  BASE_PATH: z.string().default(""),
+
   // OAuth — optional locally.
   GOOGLE_CLIENT_ID: z.string().optional(),
   // Accept multiple Apple client ids (app bundle id + service id) comma-separated.

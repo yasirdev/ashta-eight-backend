@@ -23,6 +23,23 @@ import { LOCAL_MEDIA_PREFIX, localEnabled, localMediaRouter } from "./local-medi
 
 export function createApp() {
   const app = express();
+
+  // Strip Passenger's base-URI prefix before ANY routing/parsing. Passenger mounts the app
+  // at BASE_PATH (e.g. /api) but does not strip it, so Express receives /api/health for a
+  // /health route. Runs first so every downstream middleware/router sees the clean path.
+  // Exact-match + trailing-slash only — a bare startsWith('/api') would also mangle /apiary.
+  const basePath = env.BASE_PATH; // '' by default
+  if (basePath) {
+    app.use((req, _res, next) => {
+      if (req.url === basePath) {
+        req.url = "/";
+      } else if (req.url.startsWith(basePath + "/")) {
+        req.url = req.url.slice(basePath.length);
+      }
+      next();
+    });
+  }
+
   // CORS pinned to the known browser origins (S5). Native app requests carry no
   // Origin header and are unaffected; unlisted browser origins get no CORS headers.
   app.use(cors({ origin: [env.APP_BASE_URL, env.ADMIN_ORIGIN], credentials: false }));
